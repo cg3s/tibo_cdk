@@ -8,8 +8,10 @@
 
 ```dotenv
 QUEFA_PARTNER_ID=
+QUEFA_APP_ID=
 QUEFA_KEY_ID=
 QUEFA_CLIENT_SECRET=
+QUEFA_WEBHOOK_SECRET=
 QUEFA_API_ORIGIN=https://tibo.ink
 REDEMPTION_RECORD_SECRET=
 APP_ORIGIN=http://127.0.0.1:5173
@@ -25,6 +27,12 @@ npm start
 ```
 
 打开 `http://127.0.0.1:5173`。网站名称和客服链接在 `config.js` 配置。
+
+## Quefa 应用与回调
+
+1. 在 Quefa 工作台选择接入应用。将该应用的 App ID 写入 `QUEFA_APP_ID` 供部署核对，签名凭据使用同一应用的 Partner ID、Key ID 和 Client Secret。接入包定义的签名请求头中没有 App ID。
+2. 在工作台登记 `https://你的域名/webhooks/quefa`，将回调的独立签名密钥写入 `QUEFA_WEBHOOK_SECRET`。订阅 `fulfillment.updated`、`fulfillment.succeeded`、`fulfillment.failed`、`fulfillment.cancelled` 和 `refund.succeeded`。
+3. 在 Quefa 发起测试回调，确认 HTTPS 地址可达且返回 HTTP 204。回调按事件 ID 去重，签名复查已知 CDK 订单和最新任务。浏览器轮询作为补充。
 
 ## 联调与部署
 

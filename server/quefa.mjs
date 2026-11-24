@@ -107,6 +107,8 @@ export function createQuefaClient({ origin, partnerId, keyId, clientSecret, time
     preview: (body, key) => request("POST", "/v1/cdk/preview", body, key),
     submit: (body, key) => request("POST", "/v1/redemptions", body, key),
     status: (id) => request("GET", `/v1/redemptions/${encodeURIComponent(id)}`),
+    order: (id) => request("GET", `/v1/orders/${encodeURIComponent(id)}`),
+    fulfillments: (id) => request("GET", `/v1/orders/${encodeURIComponent(id)}/fulfillments`),
     profile: () => request("GET", "/v1/agent-profile"),
   };
 }

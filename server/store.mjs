@@ -39,8 +39,21 @@ export function openStore(filename) {
       request_id TEXT
     );
     CREATE INDEX IF NOT EXISTS submissions_by_reference ON submissions(reference, revision DESC);
+    CREATE INDEX IF NOT EXISTS redemptions_by_order
+      ON redemptions(json_extract(task, '$.orderId')) WHERE task IS NOT NULL;
     CREATE UNIQUE INDEX IF NOT EXISTS open_submission
       ON submissions(reference) WHERE state IN ('pending','unknown');
+    CREATE TABLE IF NOT EXISTS webhook_receipts (
+      event_id TEXT PRIMARY KEY
+    );
+    CREATE TABLE IF NOT EXISTS webhook_checks (
+      order_id TEXT PRIMARY KEY,
+      generation INTEGER NOT NULL,
+      received_at INTEGER NOT NULL,
+      next_attempt_at INTEGER NOT NULL,
+      retries INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS webhook_checks_due ON webhook_checks(next_attempt_at);
     UPDATE submissions SET state = 'unknown' WHERE state = 'pending';
     DELETE FROM browser_sessions WHERE expires_at <= unixepoch('subsec') * 1000;
   `);
@@ -75,6 +88,43 @@ export function openStore(filename) {
   return {
     read,
     close: () => db.close(),
+    recordsForOrder(orderId) {
+      return db.prepare(`
+        SELECT reference FROM redemptions WHERE task IS NOT NULL AND json_extract(task, '$.orderId') = ?
+      `).all(orderId).map(({ reference }) => read(reference));
+    },
+    markOrderRefunded(orderId) {
+      db.prepare(`
+        UPDATE redemptions SET task = json_set(task, '$.orderRefunded', json('true'))
+        WHERE task IS NOT NULL AND json_extract(task, '$.orderId') = ?
+      `).run(orderId);
+    },
+    receiveWebhook({ id, orderId }) {
+      return transaction(() => {
+        const receipt = db.prepare("INSERT INTO webhook_receipts VALUES (?) ON CONFLICT DO NOTHING").run(id);
+        if (!receipt.changes || !orderId) return false;
+        const now = Date.now();
+        db.prepare(`
+          INSERT INTO webhook_checks (order_id, generation, received_at, next_attempt_at)
+          VALUES (?, 1, ?, ?)
+          ON CONFLICT(order_id) DO UPDATE SET generation = generation + 1, received_at = excluded.received_at
+        `).run(orderId, now, now);
+        return true;
+      });
+    },
+    dueWebhookChecks(now) {
+      return db.prepare("SELECT * FROM webhook_checks WHERE next_attempt_at <= ? ORDER BY next_attempt_at LIMIT 10").all(now);
+    },
+    finishWebhookCheck(check, retryInMs) {
+      if (retryInMs === undefined) {
+        db.prepare("DELETE FROM webhook_checks WHERE order_id = ? AND generation = ?")
+          .run(check.order_id, check.generation);
+        return;
+      }
+      db.prepare(`
+        UPDATE webhook_checks SET next_attempt_at = ?, retries = retries + 1 WHERE order_id = ?
+      `).run(Date.now() + retryInMs, check.order_id);
+    },
     claimed: (codeHash) => claim.get(codeHash)?.reference,
     create({ reference, codeHash, recoveryHash, productName, targetPlan }) {
       db.prepare("INSERT INTO redemptions VALUES (?, ?, ?, ?, ?, NULL)")
@@ -131,7 +181,11 @@ export function openStore(filename) {
           WHERE reference = ? AND revision = ? AND state = 'pending'
         `).run(state, requestId, reference, revision);
         if (!result.changes) return;
-        if (task) setTask.run(JSON.stringify(task), reference);
+        if (task) {
+          const oldTask = read(reference).task;
+          if (oldTask?.orderId === task.orderId && oldTask.orderRefunded) task.orderRefunded = true;
+          setTask.run(JSON.stringify(task), reference);
+        }
         if (state === "rejected" && !read(reference).task) {
           db.prepare("DELETE FROM code_claims WHERE reference = ?").run(reference);
         }
@@ -151,6 +205,7 @@ export function openStore(filename) {
         if (sameTask && ["succeeded", "failed", "cancelled"].includes(record.task.status) &&
             ["queued", "running"].includes(task.status) &&
             !(task.version !== null && task.version > (record.task.version ?? -1))) return;
+        if (record.task.orderRefunded) task.orderRefunded = true;
         setTask.run(JSON.stringify(task), reference);
         if (!sameTask && record.submission?.state === "unknown") {
           db.prepare("UPDATE submissions SET state = 'accepted' WHERE revision = ?")

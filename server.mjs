@@ -6,6 +6,7 @@ import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createQuefaClient, MAX_QUEFA_BODY, QuefaError } from "./server/quefa.mjs";
 import { openStore, RECONCILE_WINDOW_MS, SESSION_MAX_AGE } from "./server/store.mjs";
+import { verifyWebhook, WEBHOOK_BODY_LIMIT } from "./server/webhook.mjs";
 
 const STATIC_FILES = {
   "/": ["index.html", "text/html; charset=utf-8"],
@@ -56,22 +57,27 @@ function json(response, status, body, retryAfter) {
   response.end(JSON.stringify(body));
 }
 
-async function readJson(request) {
+async function readBody(request, limit) {
   if (!/^application\/json(?:\s*;|$)/i.test(request.headers["content-type"] ?? "")) {
     throw new ApiError(415, "请使用 JSON 提交兑换资料。");
   }
-  if (Number(request.headers["content-length"]) > MAX_BROWSER_BODY) {
+  if (Number(request.headers["content-length"]) > limit) {
     throw new ApiError(413, "兑换资料过长，请检查复制内容。");
   }
   let size = 0;
   const chunks = [];
   for await (const chunk of request.iterator({ destroyOnReturn: false })) {
     size += chunk.length;
-    if (size > MAX_BROWSER_BODY) throw new ApiError(413, "兑换资料过长，请检查复制内容。");
+    if (size > limit) throw new ApiError(413, "兑换资料过长，请检查复制内容。");
     chunks.push(chunk);
   }
+  return Buffer.concat(chunks, size);
+}
+
+async function readJson(request) {
+  const raw = await readBody(request, MAX_BROWSER_BODY);
   try {
-    const body = JSON.parse(Buffer.concat(chunks).toString("utf8"));
+    const body = JSON.parse(raw.toString("utf8"));
     if (body && typeof body === "object" && !Array.isArray(body)) return body;
   } catch {}
   throw new ApiError(400, "兑换资料格式有误。");
@@ -122,11 +128,12 @@ function taskFrom(data, accepted = false) {
 function mayRetry(record) {
   const task = record.task;
   return Boolean(task && (!record.submission || ["accepted", "rejected"].includes(record.submission.state)) &&
-    ["failed", "cancelled"].includes(task.status) && !task.paused && task.stage !== "review" && task.retryAllowed);
+    ["failed", "cancelled"].includes(task.status) && !task.paused && !task.orderRefunded &&
+    task.stage !== "review" && task.retryAllowed);
 }
 
 export function createRedemptionService({
-  appOrigin, dbPath, recordSecret, provider, retryEnabled = false, trustLoopbackProxy = false,
+  appOrigin, dbPath, recordSecret, provider, webhookSecret, retryEnabled = false, trustLoopbackProxy = false,
   pollMinimumMs = POLL_MINIMUM_MS, logger = console,
 }) {
   const store = openStore(dbPath);
@@ -201,10 +208,41 @@ export function createRedemptionService({
     logger.warn("quefa", { action, reference, status: error.status, requestId: error.requestId });
   }
 
-  async function refresh(record, force = false) {
+  async function verifyOrder(orderId) {
+    const { data: order } = await provider.order(orderId);
+    if (order.order_id !== orderId || order.fulfillment_mode !== "cdk" || order.delivery_mode === "auto_recharge" ||
+        !["pending", "paid", "expired", "closed", "partially_refunded", "refunded"].includes(order.payment_status)) {
+      throw new QuefaError();
+    }
+    if (order.payment_status === "refunded") store.markOrderRefunded(orderId);
+    const { data: list } = await provider.fulfillments(orderId);
+    if (!Array.isArray(list)) throw new QuefaError();
+    let latest;
+    for (const item of list) {
+      if (!item || item.order_id !== orderId || item.fulfillment_mode !== "cdk" ||
+          !Number.isSafeInteger(item.attempt_no) || item.attempt_no < 1 || !safeTaskId(item.fulfillment_id) ||
+          (latest?.attempt_no === item.attempt_no && latest.fulfillment_id !== item.fulfillment_id)) {
+        throw new QuefaError();
+      }
+      if (!latest || item.attempt_no > latest.attempt_no) latest = item;
+    }
+    if (!latest) throw new QuefaError();
+    return {
+      taskId: latest.fulfillment_id,
+      attempt: latest.attempt_no,
+      canRedeem: ["paid", "partially_refunded"].includes(order.payment_status),
+    };
+  }
+
+  async function refresh(record, force = false, checkOrder = false) {
     if (!record.task || record.submission?.state === "pending") return { stale: false };
     const { reference, task } = record;
-    if (inflight.has(reference)) return inflight.get(reference);
+    const active = inflight.get(reference);
+    if (active) {
+      if (!checkOrder || active.checkOrder) return active.job;
+      await active.job;
+      return refresh(store.read(reference), true, true);
+    }
     const now = Date.now();
     for (const [key, previous] of lastPoll) if (now - previous.at > 60000) lastPoll.delete(key);
     const previous = lastPoll.get(reference);
@@ -213,7 +251,12 @@ export function createRedemptionService({
     }
     const job = (async () => {
       try {
-        let id = task.id;
+        const verified = checkOrder ? await verifyOrder(task.orderId) : null;
+        if (verified && task.attempt !== null && (verified.attempt < task.attempt ||
+            (verified.attempt === task.attempt && verified.taskId !== task.id))) {
+          throw new QuefaError();
+        }
+        let id = verified?.taskId ?? task.id;
         let response = await provider.status(id);
         const latestId = response.data.latest_redemption_id;
         if (response.data.redemption_id !== id || response.data.order_id !== task.orderId) throw new QuefaError();
@@ -227,6 +270,11 @@ export function createRedemptionService({
             (response.data.latest_redemption_id != null && response.data.latest_redemption_id !== id)) {
           throw new QuefaError();
         }
+        if (verified && id === verified.taskId) {
+          if (updated.attempt !== null && updated.attempt !== verified.attempt) throw new QuefaError();
+          updated.attempt = verified.attempt;
+        }
+        if (verified && !verified.canRedeem) updated.retryAllowed = false;
         const applied = store.applyStatus(reference, task.id, updated);
         return { stale: !applied };
       } catch (error) {
@@ -234,15 +282,60 @@ export function createRedemptionService({
         warn("status", reference, error);
         return { stale: true, retryAfter: error.retryAfter };
       }
-    })();
-    inflight.set(reference, job);
-    try {
-      const result = await job;
+    })().then((result) => {
       lastPoll.set(reference, { at: Date.now(), taskId: store.read(reference).task?.id, result });
       return result;
-    } finally {
+    }).finally(() => {
       inflight.delete(reference);
+    });
+    inflight.set(reference, { job, checkOrder });
+    return job;
+  }
+
+  let webhookTimer;
+  let webhookJob;
+  let closing = false;
+  function drainWebhookChecks() {
+    if (closing || webhookJob) return;
+    webhookJob = (async () => {
+      for (const check of store.dueWebhookChecks(Date.now())) {
+        if (closing) break;
+        const age = Date.now() - check.received_at;
+        const records = store.recordsForOrder(check.order_id);
+        if (!records.length) {
+          store.finishWebhookCheck(check, age < 5 * 60000 ? 5000 : undefined);
+          continue;
+        }
+        const retryDelay = Math.min(5000 * 2 ** check.retries, 300000);
+        let retryInMs;
+        for (const record of records) {
+          if (record.submission?.state === "pending") {
+            retryInMs = Math.max(retryInMs ?? 0, 5000);
+            continue;
+          }
+          const result = await refresh(record, true, true);
+          if (result.stale) {
+            retryInMs = Math.max(retryInMs ?? 0, retryDelay, (result.retryAfter ?? 0) * 1000);
+          }
+        }
+        store.finishWebhookCheck(check, age < RECONCILE_WINDOW_MS ? retryInMs : undefined);
+      }
+    })().catch((error) => {
+      logger.error("quefa webhook sync failed", { type: error?.name });
+    }).finally(() => {
+      webhookJob = undefined;
+    });
+  }
+
+  async function webhook(request, response) {
+    if (!webhookSecret) throw new ApiError(503, "Quefa Webhook 未配置。");
+    const body = await readBody(request, WEBHOOK_BODY_LIMIT);
+    const receipt = verifyWebhook({ headers: request.headers, body, secret: webhookSecret });
+    if (receipt.status) {
+      throw new ApiError(receipt.status, receipt.status === 401 ? "Webhook 验签失败。" : "Webhook 事件无效。");
     }
+    if (store.receiveWebhook(receipt)) response.once("finish", drainWebhookChecks);
+    response.writeHead(204).end();
   }
 
   async function preview(request, response, current, cookie) {
@@ -385,6 +478,11 @@ export function createRedemptionService({
         response.writeHead(200, { "Content-Type": type, "Content-Length": body.byteLength });
         return response.end(method === "HEAD" ? undefined : body);
       }
+      if (pathname === "/webhooks/quefa") {
+        if (method === "POST") return await webhook(request, response);
+        response.setHeader("Allow", "POST");
+        throw new ApiError(405, "Webhook 仅接受 POST。");
+      }
       if (!pathname?.startsWith("/api/redemption/")) throw new ApiError(404, "页面不存在。");
       if (method !== "GET" && request.headers.origin !== appOrigin) throw new ApiError(403, "请从本站提交请求。");
       const cookie = lookup(request);
@@ -414,7 +512,19 @@ export function createRedemptionService({
       }
     }
   });
-  server.once("close", () => store.close());
+  if (webhookSecret) {
+    server.once("listening", () => {
+      webhookTimer = setInterval(drainWebhookChecks, 1000);
+      webhookTimer.unref();
+      drainWebhookChecks();
+    });
+  }
+  server.once("close", () => {
+    closing = true;
+    clearInterval(webhookTimer);
+    if (webhookJob) void webhookJob.then(() => store.close());
+    else store.close();
+  });
   return server;
 }
 
@@ -424,11 +534,14 @@ async function main() {
   const production = process.env.NODE_ENV === "production";
   const origin = new URL(process.env.QUEFA_API_ORIGIN ?? "https://tibo.ink");
   const partnerId = process.env.QUEFA_PARTNER_ID;
+  const appId = process.env.QUEFA_APP_ID;
   const keyId = process.env.QUEFA_KEY_ID;
   const clientSecret = process.env.QUEFA_CLIENT_SECRET;
+  const webhookSecret = process.env.QUEFA_WEBHOOK_SECRET;
   if (!partnerId || !keyId || !clientSecret || origin.protocol !== "https:" || origin.username || origin.password) {
     throw new Error("请配置 QUEFA_PARTNER_ID、QUEFA_KEY_ID、QUEFA_CLIENT_SECRET 和 HTTPS Quefa 地址。");
   }
+  if (appId && !/^[a-zA-Z0-9_.:-]{1,120}$/.test(appId)) throw new Error("QUEFA_APP_ID 格式无效。");
   const provider = createQuefaClient({ origin: origin.origin, partnerId, keyId, clientSecret });
   if (process.argv.includes("--check-quefa")) {
     try {
@@ -437,6 +550,8 @@ async function main() {
         throw new Error("代理状态或自建兑换权限未开启。");
       }
       console.log("Quefa 代理状态正常，自建兑换权限已开启。");
+      if (appId) console.log(`Quefa 应用 App ID ${appId}`);
+      if (webhookSecret) console.log(`本站 Quefa Webhook ${new URL("/webhooks/quefa", appOrigin)}`);
     } catch (error) {
       if (!(error instanceof QuefaError)) throw error;
       throw new Error(`Quefa 权限查询失败（HTTP ${error.status}${error.requestId ? `，${error.requestId}` : ""}）。`);
@@ -451,7 +566,7 @@ async function main() {
   const server = createRedemptionService({
     appOrigin: appOrigin.origin,
     dbPath: resolve(process.env.REDEMPTION_DB_PATH ?? "data/redemptions.sqlite"),
-    recordSecret, provider,
+    recordSecret, provider, webhookSecret,
     retryEnabled: process.env.ENABLE_CDK_RETRY === "1",
     trustLoopbackProxy: process.env.TRUST_LOOPBACK_PROXY === "1",
   });

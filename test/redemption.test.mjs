@@ -1,9 +1,11 @@
 import assert from "node:assert/strict";
+import { createHmac } from "node:crypto";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { test } from "node:test";
+import { setTimeout as delay } from "node:timers/promises";
 import { createRedemptionService } from "../server.mjs";
 import { canonicalQuery, createQuefaClient, MAX_QUEFA_BODY, signRequest } from "../server/quefa.mjs";
 
@@ -11,6 +13,7 @@ const APP_ORIGIN = "http://127.0.0.1:5173";
 const partnerId = "pt_demo";
 const keyId = "key_demo_01";
 const clientSecret = "tibo_demo_secret_never_use_in_production";
+const webhookSecret = "synthetic-quefa-webhook-secret";
 const code = "SHOP_AX8D-B7X9-Z3K2";
 const session = '  { "user":{"email":"test@example.com"},"accessToken":"synthetic-session-for-tests"}\n}\n';
 const queued = {
@@ -60,7 +63,7 @@ async function listen(server) {
 const close = (server) => new Promise((resolve, reject) =>
   server.close((error) => error ? reject(error) : resolve()));
 
-async function fixture(t, { dbPath = ":memory:", retryEnabled = true } = {}) {
+async function fixture(t, { dbPath = ":memory:", retryEnabled = true, pollMinimumMs = 0 } = {}) {
   const calls = [];
   const state = {
     preview(response) {
@@ -70,6 +73,12 @@ async function fixture(t, { dbPath = ":memory:", retryEnabled = true } = {}) {
     },
     submit(response) { send(response, 202, { data: queued }); },
     status(response) { send(response, 200, { data: queued }); },
+    order(response) { send(response, 200, { data: {
+      order_id: queued.order_id, fulfillment_mode: "cdk", delivery_mode: "cdk", payment_status: "paid",
+    } }); },
+    fulfillments(response) { send(response, 200, { data: [
+      { ...queued, fulfillment_id: queued.redemption_id },
+    ] }); },
   };
   const upstream = createServer(async (request, response) => {
     const chunks = [];
@@ -90,6 +99,8 @@ async function fixture(t, { dbPath = ":memory:", retryEnabled = true } = {}) {
     if (call.path === "/v1/cdk/preview") return state.preview(response, call);
     if (call.path === "/v1/redemptions") return state.submit(response, call);
     if (call.path.startsWith("/v1/redemptions/")) return state.status(response, call);
+    if (call.path === `/v1/orders/${queued.order_id}`) return state.order(response, call);
+    if (call.path === `/v1/orders/${queued.order_id}/fulfillments`) return state.fulfillments(response, call);
     send(response, 404, { error: { code: "not_found" } });
   });
   const origin = await listen(upstream);
@@ -98,9 +109,9 @@ async function fixture(t, { dbPath = ":memory:", retryEnabled = true } = {}) {
   const provider = createQuefaClient({ origin, partnerId, keyId, clientSecret, timeoutMs: 500 });
   async function start() {
     app = createRedemptionService({
-      appOrigin: APP_ORIGIN, dbPath, retryEnabled, provider,
+      appOrigin: APP_ORIGIN, dbPath, retryEnabled, provider, webhookSecret,
       recordSecret: "record-secret-kept-across-test-restarts",
-      pollMinimumMs: 0, logger: { warn() {}, error() {} },
+      pollMinimumMs, logger: { warn() {}, error() {} },
     });
     url = await listen(app);
   }
@@ -132,6 +143,24 @@ async function fixture(t, { dbPath = ":memory:", retryEnabled = true } = {}) {
   return {
     state, calls, browser, close: () => close(app), restart: async () => { await close(app); await start(); },
     staticFile: (path) => fetch(url + path),
+    webhook(event, options = {}) {
+      const body = JSON.stringify(event, null, 2);
+      const timestamp = String(options.timestamp ?? Math.floor(Date.now() / 1000));
+      const signature = createHmac("sha256", options.secret ?? webhookSecret)
+        .update(timestamp).update(".").update(body).digest("hex");
+      return fetch(url + "/webhooks/quefa", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Quefa-Timestamp": timestamp,
+          "X-Quefa-Signature": `t=${timestamp},v1=${signature}`,
+          "X-Quefa-Event": event.event,
+          "X-Quefa-Event-Id": options.id ?? event.event_id,
+          "X-Quefa-Delivery": options.delivery ?? "dlv_test",
+        },
+        body: options.tamper ? body + " " : body,
+      });
+    },
   };
 }
 
@@ -305,5 +334,103 @@ test("manual retry stays disabled before sandbox validation even with eligible s
   const status = await buyer.api("status");
   assert.equal(status.data.canRetry, false);
   assert.equal((await buyer.api("submit", submission(status.data, { intent: "retry" }))).status, 409);
+  assert.equal(app.calls.filter((call) => call.path === "/v1/redemptions").length, 1);
+});
+
+const notice = (id, event, extra = {}) => ({
+  event_id: id, event, occurred_at: "2026-11-24T08:00:00Z",
+  data: { order_id: queued.order_id, ...extra },
+});
+
+async function waitForQuery(app, path, count = 1) {
+  const deadline = Date.now() + 3000;
+  while (Date.now() < deadline) {
+    if (app.calls.filter((call) => call.path === path).length >= count) return;
+    await delay(10);
+  }
+  assert.fail(`No webhook query for ${path}`);
+}
+
+test("receives Quefa test deliveries and rejects invalid signatures, timestamps and event IDs", async (t) => {
+  const app = await fixture(t);
+  const event = notice("evt_test", "webhook.test");
+  assert.equal((await app.staticFile("/webhooks/quefa")).status, 405);
+  assert.equal((await app.webhook(event, { tamper: true })).status, 401);
+  assert.equal((await app.webhook(event, { secret: clientSecret })).status, 401);
+  assert.equal((await app.webhook(event, { timestamp: Math.floor(Date.now() / 1000) - 301 })).status, 401);
+  assert.equal((await app.webhook(event, { id: "evt_different" })).status, 400);
+  assert.equal((await app.webhook(event)).status, 204);
+  assert.equal((await app.webhook(event, { delivery: "dlv_again" })).status, 204);
+  assert.equal(app.calls.length, 0);
+});
+
+test("acknowledges before querying and syncs the latest CDK attempt despite an old delivery", async (t) => {
+  const app = await fixture(t, { pollMinimumMs: 20000 });
+  const buyer = app.browser();
+  const preview = await buyer.api("preview", { code });
+  await buyer.api("submit", submission(preview.data));
+
+  const latest = { ...failed, redemption_id: "ful_attempt_2", attempt_no: 2, progress_version: 2 };
+  let notifyQuery;
+  const queryStarted = new Promise((resolve) => { notifyQuery = resolve; });
+  let releaseOrder;
+  const orderPaused = new Promise((resolve) => { releaseOrder = resolve; });
+  const orderResponse = app.state.order;
+  app.state.order = async (response) => {
+    notifyQuery();
+    await orderPaused;
+    orderResponse(response);
+  };
+  app.state.fulfillments = (response) => send(response, 200, { data: [
+    { ...latest, fulfillment_id: latest.redemption_id },
+    { ...queued, fulfillment_id: queued.redemption_id },
+  ] });
+  app.state.status = (response) => send(response, 200, { data: latest });
+  const staleEvent = notice("evt_old_progress", "fulfillment.updated", {
+    redemption_id: queued.redemption_id, attempt_no: 1, status: "succeeded", message: "旧提示",
+  });
+  try {
+    assert.equal((await app.webhook(staleEvent)).status, 204);
+    await queryStarted;
+    assert.equal((await app.webhook(staleEvent, { delivery: "dlv_repeat" })).status, 204);
+  } finally {
+    releaseOrder();
+  }
+  // Let the callback start the signed reads before opening the customer's status page.
+  await waitForQuery(app, "/v1/redemptions/ful_attempt_2");
+  const status = await buyer.api("status");
+  assert.equal(status.data.phase, "failed");
+  assert.equal(status.data.canRetry, true);
+  assert.equal(status.data.message, failed.message);
+  assert.deepEqual(app.calls.slice(2).map((call) => call.path), [
+    `/v1/orders/${queued.order_id}`, `/v1/orders/${queued.order_id}/fulfillments`, "/v1/redemptions/ful_attempt_2",
+  ]);
+});
+
+test("persists callback deduplication and blocks CDK retries after confirming a full refund", async (t) => {
+  const directory = await mkdtemp(join(tmpdir(), "tibo-webhook-"));
+  const app = await fixture(t, { dbPath: join(directory, "test.sqlite"), pollMinimumMs: 20000 });
+  t.after(() => rm(directory, { recursive: true, force: true }));
+  const buyer = app.browser();
+  const preview = await buyer.api("preview", { code });
+  await buyer.api("submit", submission(preview.data));
+  app.state.status = (response) => send(response, 200, { data: failed });
+  assert.equal((await buyer.api("status")).data.canRetry, true);
+
+  app.state.order = (response) => send(response, 200, { data: {
+    order_id: queued.order_id, fulfillment_mode: "cdk", delivery_mode: "cdk", payment_status: "refunded",
+  } });
+  const refunded = notice("evt_refund", "refund.succeeded");
+  assert.equal((await app.webhook(refunded)).status, 204);
+  await waitForQuery(app, "/v1/redemptions/ful_attempt_1", 2);
+  const result = await buyer.api("status");
+  assert.equal(result.data.phase, "failed");
+  assert.equal(result.data.canRetry, false);
+  await app.restart();
+  assert.equal((await app.webhook(refunded, { delivery: "dlv_restart" })).status, 204);
+  const restored = await buyer.api("status");
+  assert.equal(restored.data.canRetry, false);
+  assert.equal((await buyer.api("submit", submission(restored.data, { intent: "retry" }))).status, 409);
+  assert.equal(app.calls.filter((call) => call.path === `/v1/orders/${queued.order_id}`).length, 1);
   assert.equal(app.calls.filter((call) => call.path === "/v1/redemptions").length, 1);
 });
