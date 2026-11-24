@@ -1,0 +1,10 @@
+{
+  "name": "tibo-cdk",
+  "private": true,
+  "engines": { "node": ">=24" },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env server.mjs",
+    "check:quefa": "node --env-file-if-exists=.env server.mjs --check-quefa",
+    "test": "node --test"
+  }
+}
