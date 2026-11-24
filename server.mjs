@@ -36,6 +36,13 @@ const PUBLIC_ERRORS = {
   recharge_credential_unchanged: "请重新登录并提交最新的完整 Session。",
   invalid_request: "兑换资料格式有误，请检查卡密和 Session。",
 };
+const QUEFA_CHECK_HINTS = {
+  ip_not_allowed: "检查该应用的 IP 白名单，确认运行命令的机器使用了已登记的出口 IP。",
+  api_access_required: "在 Quefa 工作台核对代理和该应用的 API 权限。",
+  custom_redemption_disabled: "在 Quefa 工作台核对代理的自建兑换权限。",
+  invalid_signature: "确认 Partner ID、Key ID 和 Client Secret 属于同一应用及环境。",
+  timestamp_out_of_range: "同步运行命令的机器的系统时间，再重新检查。",
+};
 
 class ApiError extends Error {
   constructor(status, message, retryAfter) {
@@ -123,6 +130,18 @@ function taskFrom(data, accepted = false) {
       data.fallback_recharge_available === true && data.recovery_action !== "refund",
     refundInProgress: !accepted && data.recovery_action === "refund",
   };
+}
+
+function describeQuefaCheckError(error, endpoint) {
+  if (!error.receivedResponse) {
+    return `无法连接 Quefa 权限接口 ${endpoint}，请检查 API 地址和本机网络。`;
+  }
+  const hasCode = error.code !== "upstream_unavailable";
+  const details = [`HTTP ${error.status}`, hasCode ? error.code : "未返回 Quefa 错误码"];
+  if (error.requestId) details.push(`Request ID ${error.requestId}`);
+  const hint = Object.hasOwn(QUEFA_CHECK_HINTS, error.code) ? QUEFA_CHECK_HINTS[error.code]
+    : error.status === 403 ? "请核对 Quefa API 地址、应用权限和运行机器的出口 IP 白名单。" : "";
+  return `Quefa 权限查询失败（${details.join("，")}）。\n请求地址 ${endpoint}。${hint}`;
 }
 
 function mayRetry(record) {
@@ -546,15 +565,17 @@ async function main() {
   if (process.argv.includes("--check-quefa")) {
     try {
       const { data } = await provider.profile();
-      if (data.merchant?.status !== "active" || data.profile?.customRedemptionEnabled !== true) {
-        throw new Error("代理状态或自建兑换权限未开启。");
+      if (typeof data.merchant?.status !== "string" || typeof data.profile?.customRedemptionEnabled !== "boolean") {
+        throw new Error("Quefa 权限响应缺少代理状态或自建兑换开关。");
       }
+      if (data.merchant.status !== "active") throw new Error("Quefa API 已连通，代理账号当前未启用。");
+      if (!data.profile.customRedemptionEnabled) throw new Error("Quefa API 已连通，代理尚未开启自建兑换权限。");
       console.log("Quefa 代理状态正常，自建兑换权限已开启。");
       if (appId) console.log(`Quefa 应用 App ID ${appId}`);
       if (webhookSecret) console.log(`本站 Quefa Webhook ${new URL("/webhooks/quefa", appOrigin)}`);
     } catch (error) {
       if (!(error instanceof QuefaError)) throw error;
-      throw new Error(`Quefa 权限查询失败（HTTP ${error.status}${error.requestId ? `，${error.requestId}` : ""}）。`);
+      throw new Error(describeQuefaCheckError(error, new URL("/v1/agent-profile", origin)));
     }
     return;
   }

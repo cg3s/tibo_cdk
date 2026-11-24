@@ -1,5 +1,7 @@
 import assert from "node:assert/strict";
-import { createHmac } from "node:crypto";
+import { spawnSync } from "node:child_process";
+import { createHmac, randomInt } from "node:crypto";
+import { once } from "node:events";
 import { mkdtemp, readFile, rm } from "node:fs/promises";
 import { createServer } from "node:http";
 import { tmpdir } from "node:os";
@@ -47,17 +49,51 @@ test("matches all three Quefa signing vectors and keeps plus signs literal", () 
   assert.equal(canonicalQuery("z=x&a=+&a=%21&a=%20"), "a=%20&a=%21&a=%2B&z=x");
 });
 
+test("reports actionable Quefa check errors and surfaces a request ID without echoing the response", () => {
+  const responses = [
+    [
+      JSON.stringify({ error: { code: "ip_not_allowed", request_id: "req_mock_ip", message: "raw-debug-text" } }),
+      /HTTP 403.*ip_not_allowed.*req_mock_ip/,
+    ],
+    ["<html>raw-debug-text</html>", /HTTP 403.*未返回 Quefa 错误码/],
+  ];
+  for (const [body, expected] of responses) {
+    const mock = `globalThis.fetch = async () => new Response(${JSON.stringify(body)}, { status: 403 });`;
+    const result = spawnSync(process.execPath, [
+      "--import", `data:text/javascript,${encodeURIComponent(mock)}`, "server.mjs", "--check-quefa",
+    ], {
+      encoding: "utf8",
+      env: {
+        ...process.env, QUEFA_API_ORIGIN: "https://tibo.ink", QUEFA_PARTNER_ID: partnerId,
+        QUEFA_APP_ID: "app_mock", QUEFA_KEY_ID: keyId, QUEFA_CLIENT_SECRET: clientSecret,
+      },
+    });
+    assert.equal(result.status, 1, result.stderr);
+    assert.match(result.stderr, expected);
+    assert.match(result.stderr, /https:\/\/tibo\.ink\/v1\/agent-profile/);
+    assert.doesNotMatch(result.stderr, /raw-debug-text|tibo_demo_secret/);
+  }
+});
+
 function send(response, status, body, headers = {}) {
   response.writeHead(status, { "Content-Type": "application/json", "X-Request-Id": "req_test", ...headers });
   response.end(JSON.stringify(body));
 }
 
 async function listen(server) {
-  await new Promise((resolve, reject) => {
-    server.once("error", reject);
-    server.listen(0, "127.0.0.1", resolve);
-  });
-  return `http://127.0.0.1:${server.address().port}`;
+  // Keep test URLs above the port range blocked by fetch.
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    const port = randomInt(20000, 49000);
+    const listening = once(server, "listening");
+    server.listen(port, "127.0.0.1");
+    try {
+      await listening;
+      return `http://127.0.0.1:${port}`;
+    } catch (error) {
+      if (!["EADDRINUSE", "EACCES"].includes(error.code)) throw error;
+    }
+  }
+  throw new Error("No loopback port available for the test server");
 }
 
 const close = (server) => new Promise((resolve, reject) =>

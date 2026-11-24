@@ -34,13 +34,16 @@ export function signRequest({
 }
 
 export class QuefaError extends Error {
-  constructor({ status = 502, code = "upstream_unavailable", requestId, retryAfter, sent = true } = {}) {
+  constructor({
+    status = 502, code = "upstream_unavailable", requestId, retryAfter, sent = true, receivedResponse = true,
+  } = {}) {
     super(code);
     this.status = status;
     this.code = code;
     this.requestId = requestId;
     this.retryAfter = retryAfter;
     this.sent = sent;
+    this.receivedResponse = receivedResponse;
   }
 }
 
@@ -84,9 +87,10 @@ export function createQuefaClient({ origin, partnerId, keyId, clientSecret, time
       });
       payload = await response.json();
     } catch {
-      if (!response) throw new QuefaError();
+      if (!response) throw new QuefaError({ receivedResponse: false });
     }
-    const requestId = safeIdentifier(response.headers.get("X-Request-Id"));
+    const requestId = safeIdentifier(response.headers.get("X-Request-Id")) ??
+      safeIdentifier(payload?.error?.request_id);
     const retryAfter = response.headers.has("Retry-After") || response.status === 429
       ? retryDelay(response.headers.get("Retry-After")) : undefined;
     if (response.status === 429 || (response.status === 503 && retryAfter)) {

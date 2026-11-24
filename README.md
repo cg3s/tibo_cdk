@@ -37,7 +37,7 @@ npm start
 ## 联调与部署
 
 - `npm test` 使用本地模拟 Quefa 服务执行签名和接口测试。沙箱联调时，将 `QUEFA_API_ORIGIN` 和三项 API 凭据一起切换到 Quefa 提供的沙箱配置。
-- `npm run check:quefa` 签名检查代理状态和 `customRedemptionEnabled`。正式部署还需确认相关商品授权、出口 IP 白名单和服务器时钟。
+- `npm run check:quefa` 签名检查代理状态和 `customRedemptionEnabled`。若返回 `ip_not_allowed`，在工作台的「开放接口 → 应用与密钥 → IP 白名单」核对运行命令的机器所用出口 IP。若返回 `api_access_required`，核对代理和应用的 API 权限。正式部署还需确认相关商品授权和服务器时钟。
 - 生产设置 `NODE_ENV=production` 和 HTTPS 的 `APP_ORIGIN`。使用单个 Node 实例，将 `REDEMPTION_DB_PATH` 指向持久卷上的 SQLite 文件，默认路径为 `data/redemptions.sqlite`。部署在同机反向代理后时，可设置 `TRUST_LOOPBACK_PROXY=1` 并由代理覆盖 `X-Real-IP`，以便按客户端 IP 限流。
 - 在沙箱验证 Quefa 允许用原卡密执行 `mode=cdk` 重提后，设置 `ENABLE_CDK_RETRY=1`。按钮还会根据最新任务的重提条件动态显示。
 - 排查时使用本站兑换编号和应用日志中的 Quefa `X-Request-Id`。代理层和日志工具应排除请求正文、Cookie 和鉴权头。
